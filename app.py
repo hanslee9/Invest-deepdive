@@ -1,6 +1,6 @@
 
 """
-개별종목 심층분석 - 최종본
+종목 심층분석 - Streamlit 마이그레이션 최종본
 - 목적: 한 종목에 대해 PER, 차트(52주), 뉴스, 애널리스트, 외부랭킹을 sub링크 없이 한 화면에
 - PWA 실패 극복: 서버에서 yfinance 직접 호출 (CORS 없음), ticker 변수화
 - 2026-08-24 배포용 정리
@@ -13,38 +13,9 @@ import plotly.graph_objects as go
 import requests
 from datetime import datetime
 import os
-import time
-import random
-
-def _fetch_with_retry(ticker: str, retries=3):
-    for attempt in range(retries):
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="1y", interval="1wk", auto_adjust=False)
-            if hist.empty or len(hist)<10:
-                hist_d = stock.history(period="1y", interval="1d", auto_adjust=False)
-                if not hist_d.empty:
-                    hist = hist_d.resample('W').last().dropna().tail(52)
-            if not hist.empty:
-                return stock, hist
-        except Exception as e:
-            if "Too Many Requests" in str(e) or "Rate limited" in str(e) or "429" in str(e):
-                time.sleep((attempt+1)*4 + random.uniform(0,2))
-                continue
-            time.sleep(1)
-    try:
-        hist = yf.download(ticker, period="1y", interval="1wk", progress=False, auto_adjust=False)
-        if not hist.empty:
-            if isinstance(hist.columns, pd.MultiIndex):
-                hist.columns = hist.columns.get_level_values(0)
-            return yf.Ticker(ticker), hist
-    except:
-        pass
-    return None, None
-
 
 st.set_page_config(
-    page_title="개별종목 심층분석",
+    page_title="종목 심층분석 - 1종목 집중",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -92,8 +63,15 @@ def fetch_stock(ticker: str):
     if not ticker:
         return None
     try:
-        stock, hist = _fetch_with_retry(ticker)
-        if hist is None or hist.empty:
+        stock = yf.Ticker(ticker)
+        # 1y 주간 - TradingView 1Y 동일
+        hist = stock.history(period="1y", interval="1wk", auto_adjust=False)
+        if hist.empty or len(hist)<10:
+            hist_d = stock.history(period="1y", interval="1d", auto_adjust=False)
+            if not hist_d.empty:
+                hist = hist_d.resample('W').last().dropna().tail(52)
+        
+        if hist.empty:
             return None
 
         # info는 yfinance에서 불안정 -> fast_info 폴백
@@ -249,8 +227,8 @@ with st.sidebar:
     st.caption("키 없으면 Yahoo 뉴스 폴백")
 
 # ---------- Main ----------
-st.title("개별종목 심층분석")
-st.caption("한 종목에 대해 PER·차트·뉴스·애널리스트·외부랭킹을 한 화면에")
+st.title("종목 심층분석 · 1종목 집중")
+st.caption("한 화면에 PER·차트·뉴스·애널리스트·외부랭킹 - sub링크 4~5번 진입 없이")
 
 if not ticker:
     st.warning("티커를 입력하세요: NVDA / SCHD / 005930")
@@ -311,16 +289,56 @@ with col_right:
         mode='lines',
         name=ticker,
         line=dict(color='#2962FF', width=2.2),
-        hovertemplate='%{x|%Y-%m-%d}<br>%{y}<extra></extra>'
+        hovertemplate='%{x|%Y-%m-%d}<br>%{y:,.2f}<extra></extra>'
     ))
-    # 52주 고/저가 라인
+    
+    # 52주 고가/저가 라인 (차트 내부)
+    high_52 = data['info'].get('fiftyTwoWeekHigh')
+    low_52 = data['info'].get('fiftyTwoWeekLow')
+    # info 없으면 차트 데이터 기준
+    if not high_52:
+        high_52 = float(max(data['chart_y'])) if data['chart_y'] else None
+    if not low_52:
+        low_52 = float(min(data['chart_y'])) if data['chart_y'] else None
+
     try:
-        fig.add_hline(y=float(data['chart_y'][-1]), line_dash="dot", line_color="gray", annotation_text="현재가")
-    except:
+        if high_52:
+            fig.add_hline(
+                y=float(high_52), 
+                line_dash="dash", 
+                line_color="#EF4444", 
+                line_width=1,
+                annotation_text=f"52주 고가 {fmt_price(ticker, float(high_52))}",
+                annotation_position="top right",
+                annotation_font_color="#EF4444",
+                annotation_font_size=11
+            )
+        if low_52:
+            fig.add_hline(
+                y=float(low_52), 
+                line_dash="dash", 
+                line_color="#22C55E", 
+                line_width=1,
+                annotation_text=f"52주 저가 {fmt_price(ticker, float(low_52))}",
+                annotation_position="bottom right",
+                annotation_font_color="#22C55E",
+                annotation_font_size=11
+            )
+        # 현재가 점선
+        fig.add_hline(
+            y=float(data['chart_y'][-1]), 
+            line_dash="dot", 
+            line_color="#6B7280", 
+            line_width=1,
+            annotation_text=f"현재 {fmt_price(ticker, float(data['chart_y'][-1]))}",
+            annotation_position="top left",
+            annotation_font_size=10
+        )
+    except Exception as e:
         pass
 
     fig.update_layout(
-        height=420,
+        height=460,
         margin=dict(l=10,r=10,t=10,b=30),
         xaxis=dict(gridcolor='#F1F5F9', showgrid=True, title=""),
         yaxis=dict(gridcolor='#F1F5F9', showgrid=True, zeroline=False, title="", autorange=True),
@@ -331,10 +349,32 @@ with col_right:
     )
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    # 검증 캡션 - PWA 가짜 데이터와 차별
+    # 별도로 52주 고/저가 지표 + 현재가 위치 시각화
+    try:
+        curr = float(data['chart_y'][-1])
+        h = float(high_52) if high_52 else curr
+        l = float(low_52) if low_52 else curr
+        # 현재가 52주 레인지에서 위치 %
+        if h != l:
+            pct_from_low = (curr - l) / (h - l) * 100
+        else:
+            pct_from_low = 50
+        
+        col_52_1, col_52_2, col_52_3 = st.columns([1, 2, 1])
+        with col_52_1:
+            st.metric("52주 저가", fmt_price(ticker, l), delta=None)
+        with col_52_2:
+            st.progress(int(max(0, min(100, pct_from_low))), text=f"현재가 52주 위치: {pct_from_low:.1f}% (저가 {l:.0f} ~ 고가 {h:.0f})")
+            st.caption(f"고가 대비 {(curr/h*100-100):+.1f}% · 저가 대비 {(curr/l*100-100):+.1f}%")
+        with col_52_3:
+            st.metric("52주 고가", fmt_price(ticker, h), delta=None)
+    except:
+        pass
+
+    # 검증 캡션
     min_v, max_v = min(data['chart_y']), max(data['chart_y'])
     vol = max_v - min_v
-    st.caption(f"검증: 포인트 {len(data['chart_y'])}개 · min {min_v:.2f} · max {max_v:.2f} · range {vol:.2f} · 변동성 {'높음 ✓' if vol> (min_v*0.15) else '낮음'} · fill:false · beginAtZero:false · tension:0.1 · 진짜 yfinance · 가짜 MOCK_DB 아님")
+    st.caption(f"검증: 포인트 {len(data['chart_y'])}개 · 52주 고가 {fmt_price(ticker, float(high_52)) if high_52 else '-'} · 저가 {fmt_price(ticker, float(low_52)) if low_52 else '-'} · range {vol:.2f} · fill:false · beginAtZero:false · 진짜 yfinance")
 
 # ---------- 하단 분석 탭: 뉴스 + 애널리스트 한 화면 ----------
 st.divider()
