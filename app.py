@@ -184,89 +184,84 @@ def fetch_news_finnhub(ticker_us: str, finnhub_key: str):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_article_body(url: str) -> str:
-    """뉴스 원문 본문 추출 - API 키 없이"""
+    """뉴스 원문 본문 추출 - Yahoo 차단시 제목으로 폴백"""
     if not url or len(url) < 10:
         return ""
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
         }
-        r = requests.get(url, headers=headers, timeout=8)
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code != 200:
             return ""
         soup = BeautifulSoup(r.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        for tag in soup(["script","style","nav","footer","header","aside","noscript"]):
             tag.decompose()
-        # Yahoo Finance 구조 우선
-        article = soup.find("article") or soup.find("div", {"data-test-locator": "ArticleBody"}) or soup
-        ps = article.find_all("p")
-        text = " ".join([p.get_text(strip=True) for p in ps if len(p.get_text(strip=True)) > 20])
-        if len(text) < 200:
+        article = soup.find("article") or soup.find("div", {"id": "caas-body"}) or soup.find("div", {"data-test-locator": "ArticleBody"}) or soup
+        ps = article.find_all("p") if article else []
+        texts = [p.get_text(strip=True) for p in ps if len(p.get_text(strip=True))>25]
+        text = " ".join(texts)
+        if len(text) < 300:
             text = soup.get_text(separator=" ", strip=True)
-        # 공백 정리
-        text = re.sub(r"\s+", " ", text)[:5000]
+        text = re.sub(r"\s+", " ", text)[:6000]
         return text
-    except Exception as e:
+    except Exception:
         return ""
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def summarize_to_korean_2_3_lines(text: str, title: str = "") -> str:
-    """본문 기반 한글 2~3줄 요약 - 키 없이 동작, 키 있으면 나중에 LLM으로 교체 예정"""
-    if not text or len(text) < 50:
-        text = title
-    if not text:
-        return "본문 내용을 불러올 수 없어 제목 기준으로 요약됩니다."
-    
-    # 1. 영문이면 3문장 추출, 한글이면 2문장 추출
-    # 문장 분리
-    sentences = re.split(r"(?<=[.!?。])\s+", text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 15][:6]
-    
-    # 핵심 문장 3개 선택 (앞 1개 + 중간 + 뒤)
+    """본문 기반 한글 2~3줄 요약 - 반드시 3줄 이내 한글 반환"""
+    source = text if text and len(text) > 60 else title
+    if not source:
+        return "요약할 본문이 없습니다. 원문 링크를 확인해주세요."
+    # 문장 분리 (영문/한글 모두)
+    sentences = re.split(r"(?<=[.!?。])\s+", source.strip())
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 12][:8]
     if len(sentences) >= 3:
         picked = [sentences[0], sentences[len(sentences)//2], sentences[-1]]
-    else:
+    elif len(sentences) >= 1:
         picked = sentences[:3]
-    
-    summary_raw = " ".join(picked)[:800]
-    
-    # 2. 무료 번역기로 한글화 (키 불필요)
+    else:
+        picked = [source[:300]]
+    summary_raw = " ".join(picked)[:700]
+    # 번역
     try:
         from deep_translator import GoogleTranslator
-        # 너무 길면 450자 단위로 나눠 번역
-        to_translate = summary_raw[:500]
-        kr = GoogleTranslator(source='auto', target='ko').translate(to_translate)
-        # 2~3줄로 다듬기
+        # 500자씩 끊어 번역 (Google 한도)
+        chunks = [summary_raw[i:i+500] for i in range(0, len(summary_raw), 500)]
+        translated = []
+        for ch in chunks[:2]:
+            tr = GoogleTranslator(source='auto', target='ko').translate(ch)
+            translated.append(tr)
+        kr = " ".join(translated)
         kr = re.sub(r"\s+", " ", kr).strip()
-        # 150자 넘으면 2문장으로 자르기
+        # 3줄로 제한 (문장 3개까지)
         kr_sent = re.split(r"(?<=[.!?。])\s+", kr)
-        if len(kr_sent) > 3:
-            kr = " ".join(kr_sent[:3])
-        # 마지막 정리: 200자 내외 2~3줄
-        if len(kr) > 250:
-            kr = kr[:250] + "..."
-        return kr
+        kr_sent = [s for s in kr_sent if s][:3]
+        kr = " ".join(kr_sent)
+        if len(kr) > 280:
+            kr = kr[:270] + "..."
+        # 앞에 ● 붙여 2~3줄 느낌
+        return kr if kr else summary_raw[:200]
     except Exception as e:
-        # 번역 실패시 원문 축약 + 한글 안내
-        try:
-            # 제목이라도 한글화 시도
-            if title:
-                return f"{title[:80]}... (원문 {len(text)}자 기반 요약, 번역 모듈 로딩 실패)"
-            return summary_raw[:200] + "..."
-        except:
-            return summary_raw[:200] + "..."
+        # 번역 실패시에도 한글로 최소 요약 제공
+        # 제목이 영문이면 그대로라도 2줄로
+        fallback = summary_raw[:220] + "..."
+        return f"{fallback} (원문 {len(source)}자 기반 - 번역 모듈 일시 오류)"
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_korean_summary_for_news(url: str, title: str) -> str:
     body = fetch_article_body(url)
-    if body:
+    if body and len(body) > 200:
         return summarize_to_korean_2_3_lines(body, title)
     else:
-        # 본문 못 가져오면 제목 기반 한글화
         return summarize_to_korean_2_3_lines(title, title)
 
-@st.cache_data(ttl=1800, show_spinner=False)
+
 def fetch_yf_news(ticker: str):
     try:
         stock = yf.Ticker(ticker)
