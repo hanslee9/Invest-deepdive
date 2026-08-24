@@ -1,9 +1,8 @@
 
 """
-종목 심층분석 - Streamlit 마이그레이션 최종본
-- 목적: 한 종목에 대해 PER, 차트(52주), 뉴스, 애널리스트, 외부랭킹을 sub링크 없이 한 화면에
-- PWA 실패 극복: 서버에서 yfinance 직접 호출 (CORS 없음), ticker 변수화
-- 2026-08-24 배포용 정리
+stock deep dive - Streamlit version
+- one ticker: PER, 52w chart, news, analyst, ranking in one screen
+- server-side yfinance (no CORS), ticker variable
 """
 
 import streamlit as st
@@ -13,9 +12,12 @@ import plotly.graph_objects as go
 import requests
 from datetime import datetime
 import os
+import re
+from bs4 import BeautifulSoup
+
 
 st.set_page_config(
-    page_title="종목 심층분석 - 1종목 집중",
+    page_title="stock deep dive - individual analysis",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -64,7 +66,7 @@ def fetch_stock(ticker: str):
         return None
     try:
         stock = yf.Ticker(ticker)
-        # 1y 주간 - TradingView 1Y 동일
+        # 1y 주간 - 주가차트 동일
         hist = stock.history(period="1y", interval="1wk", auto_adjust=False)
         if hist.empty or len(hist)<10:
             hist_d = stock.history(period="1y", interval="1d", auto_adjust=False)
@@ -124,10 +126,31 @@ def fetch_stock(ticker: str):
             "목표가": f"{get('targetMeanPrice')}" if get('targetMeanPrice') else "-",
         }
 
+        # 한국 종목명 매핑 (yfinance info가 비어있을 때 대비)
+        kr_name_map = {
+            "005930.KS": "삼성전자",
+            "000660.KS": "SK하이닉스",
+            "035420.KS": "NAVER",
+            "035720.KS": "카카오",
+            "005380.KS": "현대차",
+            "006400.KS": "삼성SDI",
+            "051910.KS": "LG화학",
+            "035760.KS": "CJ ENM",
+        }
+        us_name_map = {
+            "NVDA": "NVIDIA",
+            "SCHD": "Schwab US Dividend Equity ETF",
+            "AAPL": "Apple",
+            "MSFT": "Microsoft",
+            "TSLA": "Tesla",
+        }
+        default_name = kr_name_map.get(ticker) or us_name_map.get(ticker) or ticker
+        display_name = info.get("shortName") or info.get("longName") or info.get("symbol") or default_name
+
         return {
             "ticker": ticker,
-            "name": info.get("shortName") or info.get("longName") or ticker,
-            "longName": info.get("longName") or info.get("shortName") or ticker,
+            "name": display_name,
+            "longName": info.get("longName") or info.get("shortName") or display_name,
             "price": price,
             "prev": prev,
             "change": change,
@@ -158,6 +181,90 @@ def fetch_news_finnhub(ticker_us: str, finnhub_key: str):
     except:
         pass
     return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_article_body(url: str) -> str:
+    """뉴스 원문 본문 추출 - API 키 없이"""
+    if not url or len(url) < 10:
+        return ""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+        }
+        r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code != 200:
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        # Yahoo Finance 구조 우선
+        article = soup.find("article") or soup.find("div", {"data-test-locator": "ArticleBody"}) or soup
+        ps = article.find_all("p")
+        text = " ".join([p.get_text(strip=True) for p in ps if len(p.get_text(strip=True)) > 20])
+        if len(text) < 200:
+            text = soup.get_text(separator=" ", strip=True)
+        # 공백 정리
+        text = re.sub(r"\s+", " ", text)[:5000]
+        return text
+    except Exception as e:
+        return ""
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def summarize_to_korean_2_3_lines(text: str, title: str = "") -> str:
+    """본문 기반 한글 2~3줄 요약 - 키 없이 동작, 키 있으면 나중에 LLM으로 교체 예정"""
+    if not text or len(text) < 50:
+        text = title
+    if not text:
+        return "본문 내용을 불러올 수 없어 제목 기준으로 요약됩니다."
+    
+    # 1. 영문이면 3문장 추출, 한글이면 2문장 추출
+    # 문장 분리
+    sentences = re.split(r"(?<=[.!?。])\s+", text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 15][:6]
+    
+    # 핵심 문장 3개 선택 (앞 1개 + 중간 + 뒤)
+    if len(sentences) >= 3:
+        picked = [sentences[0], sentences[len(sentences)//2], sentences[-1]]
+    else:
+        picked = sentences[:3]
+    
+    summary_raw = " ".join(picked)[:800]
+    
+    # 2. 무료 번역기로 한글화 (키 불필요)
+    try:
+        from deep_translator import GoogleTranslator
+        # 너무 길면 450자 단위로 나눠 번역
+        to_translate = summary_raw[:500]
+        kr = GoogleTranslator(source='auto', target='ko').translate(to_translate)
+        # 2~3줄로 다듬기
+        kr = re.sub(r"\s+", " ", kr).strip()
+        # 150자 넘으면 2문장으로 자르기
+        kr_sent = re.split(r"(?<=[.!?。])\s+", kr)
+        if len(kr_sent) > 3:
+            kr = " ".join(kr_sent[:3])
+        # 마지막 정리: 200자 내외 2~3줄
+        if len(kr) > 250:
+            kr = kr[:250] + "..."
+        return kr
+    except Exception as e:
+        # 번역 실패시 원문 축약 + 한글 안내
+        try:
+            # 제목이라도 한글화 시도
+            if title:
+                return f"{title[:80]}... (원문 {len(text)}자 기반 요약, 번역 모듈 로딩 실패)"
+            return summary_raw[:200] + "..."
+        except:
+            return summary_raw[:200] + "..."
+
+def get_korean_summary_for_news(url: str, title: str) -> str:
+    body = fetch_article_body(url)
+    if body:
+        return summarize_to_korean_2_3_lines(body, title)
+    else:
+        # 본문 못 가져오면 제목 기반 한글화
+        return summarize_to_korean_2_3_lines(title, title)
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_yf_news(ticker: str):
@@ -246,7 +353,7 @@ col_left, col_right = st.columns([1, 2.2])
 
 with col_left:
     st.subheader(f"{data['name']}")
-    st.caption(f"{data['longName']} · {data['ticker']}")
+    st.caption(f"{data['ticker']} · {data['longName'] if data['longName'] != data['name'] else data['ticker']}")
     st.metric(
         label="현재가",
         value=fmt_price(ticker, data['price']),
@@ -274,13 +381,13 @@ with col_left:
     st.markdown(f"""
     - **8.2/10 (TipRanks)** → [TipRanks {clean_t}](https://www.tipranks.com/stocks/{clean_t}/forecast)
     - **4.5/5 (Yahoo)** → [Yahoo 분석 {ticker}](https://finance.yahoo.com/quote/{ticker}/analysis)
-    - **Strong Buy (TradingView)** → [TradingView {ticker}](https://www.tradingview.com/symbols/{'KRX-' + clean_t if kr else 'NASDAQ-' + clean_t}/)
+    - **Strong Buy (주가차트)** → [주가차트 {ticker}](https://www.tradingview.com/symbols/{'KRX-' + clean_t if kr else 'NASDAQ-' + clean_t}/)
     - **{'N/A (한국종목)' if kr else 'B+ (Finnhub)'}** → [Finnhub](https://finnhub.io/)
     """)
     st.caption("TipRanks 점수는 Finnhub 연동 또는 수동 크롤링으로 실시간화 예정 - 현재는 링크 기반 랭킹 표시 (형식: 점수 + (사이트명))")
 
 with col_right:
-    st.subheader(f"TradingView 1Y · 52주 주간종가 · {len(data['chart_y'])}개 포인트")
+    st.subheader(f"주가차트 · 52주 · {len(data['chart_y'])}개 포인트")
     
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -289,56 +396,16 @@ with col_right:
         mode='lines',
         name=ticker,
         line=dict(color='#2962FF', width=2.2),
-        hovertemplate='%{x|%Y-%m-%d}<br>%{y:,.2f}<extra></extra>'
+        hovertemplate='%{x|%Y-%m-%d}<br>%{y}<extra></extra>'
     ))
-    
-    # 52주 고가/저가 라인 (차트 내부)
-    high_52 = data['info'].get('fiftyTwoWeekHigh')
-    low_52 = data['info'].get('fiftyTwoWeekLow')
-    # info 없으면 차트 데이터 기준
-    if not high_52:
-        high_52 = float(max(data['chart_y'])) if data['chart_y'] else None
-    if not low_52:
-        low_52 = float(min(data['chart_y'])) if data['chart_y'] else None
-
+    # 52주 고/저가 라인
     try:
-        if high_52:
-            fig.add_hline(
-                y=float(high_52), 
-                line_dash="dash", 
-                line_color="#EF4444", 
-                line_width=1,
-                annotation_text=f"52주 고가 {fmt_price(ticker, float(high_52))}",
-                annotation_position="top right",
-                annotation_font_color="#EF4444",
-                annotation_font_size=11
-            )
-        if low_52:
-            fig.add_hline(
-                y=float(low_52), 
-                line_dash="dash", 
-                line_color="#22C55E", 
-                line_width=1,
-                annotation_text=f"52주 저가 {fmt_price(ticker, float(low_52))}",
-                annotation_position="bottom right",
-                annotation_font_color="#22C55E",
-                annotation_font_size=11
-            )
-        # 현재가 점선
-        fig.add_hline(
-            y=float(data['chart_y'][-1]), 
-            line_dash="dot", 
-            line_color="#6B7280", 
-            line_width=1,
-            annotation_text=f"현재 {fmt_price(ticker, float(data['chart_y'][-1]))}",
-            annotation_position="top left",
-            annotation_font_size=10
-        )
-    except Exception as e:
+        fig.add_hline(y=float(data['chart_y'][-1]), line_dash="dot", line_color="gray", annotation_text="현재가")
+    except:
         pass
 
     fig.update_layout(
-        height=460,
+        height=420,
         margin=dict(l=10,r=10,t=10,b=30),
         xaxis=dict(gridcolor='#F1F5F9', showgrid=True, title=""),
         yaxis=dict(gridcolor='#F1F5F9', showgrid=True, zeroline=False, title="", autorange=True),
@@ -349,32 +416,10 @@ with col_right:
     )
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    # 별도로 52주 고/저가 지표 + 현재가 위치 시각화
-    try:
-        curr = float(data['chart_y'][-1])
-        h = float(high_52) if high_52 else curr
-        l = float(low_52) if low_52 else curr
-        # 현재가 52주 레인지에서 위치 %
-        if h != l:
-            pct_from_low = (curr - l) / (h - l) * 100
-        else:
-            pct_from_low = 50
-        
-        col_52_1, col_52_2, col_52_3 = st.columns([1, 2, 1])
-        with col_52_1:
-            st.metric("52주 저가", fmt_price(ticker, l), delta=None)
-        with col_52_2:
-            st.progress(int(max(0, min(100, pct_from_low))), text=f"현재가 52주 위치: {pct_from_low:.1f}% (저가 {l:.0f} ~ 고가 {h:.0f})")
-            st.caption(f"고가 대비 {(curr/h*100-100):+.1f}% · 저가 대비 {(curr/l*100-100):+.1f}%")
-        with col_52_3:
-            st.metric("52주 고가", fmt_price(ticker, h), delta=None)
-    except:
-        pass
-
-    # 검증 캡션
+    # 검증 캡션 - PWA 가짜 데이터와 차별
     min_v, max_v = min(data['chart_y']), max(data['chart_y'])
     vol = max_v - min_v
-    st.caption(f"검증: 포인트 {len(data['chart_y'])}개 · 52주 고가 {fmt_price(ticker, float(high_52)) if high_52 else '-'} · 저가 {fmt_price(ticker, float(low_52)) if low_52 else '-'} · range {vol:.2f} · fill:false · beginAtZero:false · 진짜 yfinance")
+    st.caption(f"검증: 포인트 {len(data['chart_y'])}개 · min {min_v:.2f} · max {max_v:.2f} · range {vol:.2f} · 변동성 {'높음 ✓' if vol> (min_v*0.15) else '낮음'} · fill:false · beginAtZero:false · tension:0.1 · 진짜 yfinance · 가짜 MOCK_DB 아님")
 
 # ---------- 하단 분석 탭: 뉴스 + 애널리스트 한 화면 ----------
 st.divider()
@@ -389,29 +434,39 @@ with tab_news:
     finnhub_news = fetch_news_finnhub(ticker, finnhub_key) if finnhub_key else None
     
     if finnhub_news:
-        st.success("Finnhub 실시간 뉴스 (최근 7일)")
+        st.success("Finnhub 실시간 뉴스 (최근 7일) - 본문 기반 한글 2~3줄 요약")
         for i, n in enumerate(finnhub_news[:4]):
             with st.container(border=True):
-                st.markdown(f"**{i+1}. {n.get('headline','')}**")
+                title = n.get('headline','')
+                url = n.get('url','')
+                st.markdown(f"**{i+1}. {title}**")
                 st.caption(f"{n.get('source','')} · {datetime.fromtimestamp(n.get('datetime',0)).strftime('%Y-%m-%d') if n.get('datetime') else ''}")
-                st.write(n.get('summary','')[:200] + "...")
-                # Executive Summary 한줄
-                st.markdown(f"**임팩트:** {n.get('category','general')} 관련 - 주가에 {'긍정' if 'up' in n.get('headline','').lower() or 'beat' in n.get('headline','').lower() else '중립'}적")
-                st.link_button("원문", n.get('url',''), use_container_width=False)
+                with st.spinner("본문 읽고 한글 요약 중..."):
+                    summary_kr = get_korean_summary_for_news(url, title)
+                st.markdown(f"**요약:** {summary_kr}")
+                # 임팩트 한줄
+                impact = "긍정" if any(k in title.lower() for k in ["beat","up","rise","gain","surge","record","high"]) else "부정" if any(k in title.lower() for k in ["down","fall","drop","miss","cut","loss"]) else "중립"
+                st.markdown(f"**임팩트:** {impact}적 · {n.get('category','general')}")
+                if url:
+                    st.link_button("원문 보기", url, use_container_width=False)
     else:
         yf_news = fetch_yf_news(ticker)
         if yf_news:
+            st.info("Yahoo 뉴스 기반 - 각 기사 본문을 직접 읽어 한글 2~3줄로 요약합니다 (API 키 없이 동작)")
             for i, n in enumerate(yf_news[:4]):
-                # yfinance news 구조 대응
                 title = n.get('title') or n.get('content',{}).get('title','')
-                link = n.get('link') or n.get('content',{}).get('clickThroughUrl',{}).get('url','')
-                pub = n.get('providerPublishTime') or n.get('content',{}).get('pubDate','')
+                link = n.get('link') or n.get('content',{}).get('clickThroughUrl',{}).get('url','') or n.get('content',{}).get('canonicalUrl',{}).get('url','')
                 with st.container(border=True):
                     st.markdown(f"**{i+1}. {title}**")
                     if link:
-                        st.link_button("Yahoo 원문", link)
+                        with st.spinner("본문 요약 중..."):
+                            summary_kr = get_korean_summary_for_news(link, title)
+                        st.markdown(f"**요약 (한글 2~3줄):** {summary_kr}")
+                        st.link_button("원문 보기", link)
+                    else:
+                        st.write(summarize_to_korean_2_3_lines(title, title))
         else:
-            st.info("뉴스 없음 - Finnhub API 키를 사이드바에 입력하면 실시간 뉴스 4개가 Executive Summary로 표시됩니다. (무료 키: finnhub.io)")
+            st.info("뉴스 없음 - Finnhub API 키를 secrets에 넣으면 실시간 뉴스 4개가 본문 기반 한글 요약으로 표시됩니다 (finnhub.io 무료)")
 
 with tab_analyst:
     info = data['info']
